@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"html/template"
 	"log"
@@ -12,19 +14,17 @@ import (
 	"golang.org/x/oauth2"
 )
 
-// simple struct to show user claims on page
 type ClaimsPage struct {
 	Claims map[string]interface{}
 }
 
 var (
-	// getting client credentials from environment variables 
 	clientID     = os.Getenv("CLIENT_ID")
 	clientSecret = os.Getenv("CLIENT_SECRET")
 
-	redirectURL = "http://localhost:8080/callback"
+	// Fix: using HTTPS instead of HTTP to secure communication
+	redirectURL = "https://localhost:8080/callback"
 
-	// cognito issuer URL
 	issuerURL = "https://cognito-idp.us-east-1.amazonaws.com/us-east-1_VSFgetsPW"
 
 	provider     *oidc.Provider
@@ -35,16 +35,13 @@ var (
 func init() {
 	var err error
 
-	// creating OIDC provider
 	provider, err = oidc.NewProvider(context.Background(), issuerURL)
 	if err != nil {
 		log.Fatalf("Error creating provider: %v", err)
 	}
 
-	// verifying token with client ID
 	verifier = provider.Verifier(&oidc.Config{ClientID: clientID})
 
-	// OAuth2 configuration
 	oauth2Config = &oauth2.Config{
 		ClientID:     clientID,
 		ClientSecret: clientSecret,
@@ -54,28 +51,41 @@ func init() {
 	}
 }
 
+// Fix: generate secure random state to prevent attacks
+func generateState() string {
+	b := make([]byte, 16)
+	_, err := rand.Read(b)
+	if err != nil {
+		return "fallbackstate"
+	}
+	return hex.EncodeToString(b)
+}
+
 func main() {
-	// defining routes
 	http.HandleFunc("/", homeHandler)
 	http.HandleFunc("/login", loginHandler)
 	http.HandleFunc("/callback", callbackHandler)
 
 	fmt.Println("Server started at http://localhost:8080")
-
 	log.Fatal(http.ListenAndServe(":8080", nil))
 }
 
 func homeHandler(w http.ResponseWriter, r *http.Request) {
-	// homepage with login link
 	fmt.Fprint(w, `<h1>Login App</h1><a href="/login">Login</a>`)
 }
 
 func loginHandler(w http.ResponseWriter, r *http.Request) {
 
-	state := "12345"
+	// Fix: using generated random state instead of hardcoded value
+	state := generateState()
+
+	http.SetCookie(w, &http.Cookie{
+		Name:  "oauth_state",
+		Value: state,
+		Path:  "/",
+	})
 
 	url := oauth2Config.AuthCodeURL(state)
-
 	http.Redirect(w, r, url, http.StatusFound)
 }
 
@@ -83,6 +93,14 @@ func callbackHandler(w http.ResponseWriter, r *http.Request) {
 	ctx := context.Background()
 
 	code := r.URL.Query().Get("code")
+	state := r.URL.Query().Get("state")
+
+	// Fix: validate state to prevent CSRF attacks
+	cookie, err := r.Cookie("oauth_state")
+	if err != nil || cookie.Value != state {
+		http.Error(w, "Invalid state parameter", http.StatusBadRequest)
+		return
+	}
 
 	token, err := oauth2Config.Exchange(ctx, code)
 	if err != nil {
@@ -90,25 +108,33 @@ func callbackHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	rawIDToken, _ := token.Extra("id_token").(string)
+	// Fix: check if id_token exists before using it
+	rawIDToken, ok := token.Extra("id_token").(string)
+	if !ok {
+		http.Error(w, "Missing ID token", http.StatusInternalServerError)
+		return
+	}
 
-	// verifying token
 	idToken, err := verifier.Verify(ctx, rawIDToken)
 	if err != nil {
 		http.Error(w, "Verify error", http.StatusInternalServerError)
 		return
 	}
 
-	// extracting claims from token
 	claims := map[string]interface{}{}
 	idToken.Claims(&claims)
 
-	pageData := ClaimsPage{Claims: claims}
+	// Fix: only expose necessary safe fields (avoid sensitive data leak)
+	filteredClaims := map[string]interface{}{
+		"email": claims["email"],
+		"name":  claims["name"],
+	}
+
+	pageData := ClaimsPage{Claims: filteredClaims}
 
 	tmpl := `<h2>User Info</h2>
 	<ul>{{range $k,$v := .Claims}}<li>{{$k}}: {{$v}}</li>{{end}}</ul>`
 
 	t := template.Must(template.New("page").Parse(tmpl))
-
 	t.Execute(w, pageData)
 }
